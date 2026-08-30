@@ -322,9 +322,7 @@ async def handler(event):
     await add_event("keyword", chat_name, matched, text[:200])
     await send_to_log_channel(chat_name, matched, text[:200])
 
-    if matched in PUSH_ONLY_KEYWORDS:
-        await send_push(chat_name, matched, text[:200])
-    else:
+    if matched not in PUSH_ONLY_KEYWORDS:
         await make_calls(channel=chat_name, keyword=matched)
 
 
