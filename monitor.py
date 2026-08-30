@@ -19,6 +19,7 @@ import logging
 import os
 import time
 
+import asyncpg
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
@@ -29,6 +30,10 @@ from twilio.rest import Client as TwilioClient
 load_dotenv(".env", override=True)
 
 # ---------- Налаштування ----------
+
+# База даних (PostgreSQL на Railway — DATABASE_URL підставляється автоматично,
+# якщо в тому ж проєкті додано сервіс Postgres і прив'язано змінну)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Telegram
 API_ID = int(os.getenv("TG_API_ID"))
@@ -74,26 +79,99 @@ logging.basicConfig(
 )
 log = logging.getLogger("monitor")
 
-# ---------- Стан ----------
+# ---------- Стан (частково в пам'яті, події і лічильник — у Postgres) ----------
 
 class State:
-    active: bool = True  # моніторинг активний за замовчуванням
+    active: bool = True  # моніторинг активний за замовчуванням (перезаписується з БД при старті)
     last_call_ts: float = 0.0
-    events: list = []  # журнал знайдених ключових слів / дзвінків (найновіші перші)
-    calls_today: int = 0
-    calls_today_date: str = ""
 
 state = State()
 
-MAX_LOG_ENTRIES = 100
+db_pool: asyncpg.Pool | None = None
 
 
-def bump_call_counter():
-    today = time.strftime("%Y-%m-%d")
-    if state.calls_today_date != today:
-        state.calls_today_date = today
-        state.calls_today = 0
-    state.calls_today += 1
+async def init_db():
+    """Створює пул з'єднань і таблиці, якщо їх ще немає."""
+    global db_pool
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL не задано — журнал подій і лічильник НЕ будуть зберігатись між рестартами.")
+        return
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+                kind TEXT NOT NULL,
+                channel TEXT,
+                keyword TEXT,
+                snippet TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'active'")
+        if row is not None:
+            state.active = row["value"] == "true"
+    log.info("Підключено до Postgres, стан 'active' завантажено: %s", state.active)
+
+
+async def set_active_in_db(active: bool):
+    state.active = active
+    if db_pool is None:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('active', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = $1",
+            "true" if active else "false",
+        )
+
+
+async def add_event(kind: str, channel: str, keyword: str, snippet: str = ""):
+    """Записує подію в Postgres (для показу на сайті через /logs)."""
+    if db_pool is None:
+        log.debug("Подія не збережена (немає БД): %s / %s / %s", kind, channel, keyword)
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO events (kind, channel, keyword, snippet) VALUES ($1, $2, $3, $4)",
+            kind, channel, keyword, snippet,
+        )
+
+
+async def get_recent_events(limit: int = 100):
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT ts, kind, channel, keyword, snippet FROM events ORDER BY ts DESC LIMIT $1",
+            limit,
+        )
+    return [
+        {
+            "time": r["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": r["kind"],
+            "channel": r["channel"] or "",
+            "keyword": r["keyword"] or "",
+            "snippet": r["snippet"] or "",
+        }
+        for r in rows
+    ]
+
+
+async def get_calls_today() -> int:
+    if db_pool is None:
+        return 0
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM events WHERE kind = 'call' AND ts::date = (now() AT TIME ZONE 'Europe/Kyiv')::date"
+        )
+    return count or 0
 
 
 def add_event(kind: str, channel: str, keyword: str, snippet: str = ""):
@@ -109,7 +187,7 @@ def add_event(kind: str, channel: str, keyword: str, snippet: str = ""):
 
 # ---------- Twilio ----------
 
-def make_calls(channel: str = "", keyword: str = ""):
+async def make_calls(channel: str = "", keyword: str = ""):
     """Дзвонить на всі номери зі списку MY_PHONE_NUMBERS."""
     now = time.time()
     if now - state.last_call_ts < COOLDOWN_SECONDS:
@@ -126,11 +204,10 @@ def make_calls(channel: str = "", keyword: str = ""):
                 from_=TWILIO_FROM_NUMBER,
             )
             log.info("Дзвінок на %s ініційовано, SID: %s", number, call.sid)
-            add_event("call", channel, keyword, f"дзвінок на {number}")
-            bump_call_counter()
+            await add_event("call", channel, keyword, f"дзвінок на {number}")
         except Exception as e:
             log.error("Помилка при дзвінку на %s: %s", number, e)
-            add_event("call_error", channel, keyword, f"{number}: {e}")
+            await add_event("call_error", channel, keyword, f"{number}: {e}")
 
 
 def text_matches_keywords(text: str) -> str | None:
@@ -159,7 +236,7 @@ async def send_push(channel: str, keyword: str, snippet: str):
         text = f"⚠️ Знайдено '{keyword}' у [{channel}]:\n{snippet}"
         await tg_client.send_message("me", text)
         log.info("Push-повідомлення надіслано ('%s', %s)", keyword, channel)
-        add_event("push", channel, keyword, snippet)
+        await add_event("push", channel, keyword, snippet)
     except Exception as e:
         log.error("Помилка надсилання push: %s", e)
 
@@ -184,18 +261,18 @@ async def handler(event):
     excluded = text_has_exclusion(text)
     if excluded:
         log.info("Пропущено — містить стоп-фразу '%s'", excluded)
-        add_event("excluded", "", matched, f"стоп-фраза: {excluded}")
+        await add_event("excluded", "", matched, f"стоп-фраза: {excluded}")
         return
 
     chat = await event.get_chat()
     chat_name = str(getattr(chat, "username", None) or getattr(chat, "title", "?"))
     log.info("[%s] Знайдено '%s' у: %s", chat_name, matched, text[:200])
-    add_event("keyword", chat_name, matched, text[:200])
+    await add_event("keyword", chat_name, matched, text[:200])
 
     if matched in PUSH_ONLY_KEYWORDS:
         await send_push(chat_name, matched, text[:200])
     else:
-        make_calls(channel=chat_name, keyword=matched)
+        await make_calls(channel=chat_name, keyword=matched)
 
 
 # ---------- HTTP API (керування з сайту) ----------
@@ -218,8 +295,7 @@ def check_secret(x_api_key: str | None):
 @app.get("/status")
 async def status(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
-    today = time.strftime("%Y-%m-%d")
-    calls_today = state.calls_today if state.calls_today_date == today else 0
+    calls_today = await get_calls_today()
     return {
         "active": state.active,
         "channels": CHANNELS,
@@ -231,13 +307,13 @@ async def status(x_api_key: str | None = Header(default=None)):
 @app.get("/logs")
 async def logs(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
-    return {"events": state.events}
+    return {"events": await get_recent_events()}
 
 
 @app.post("/start")
 async def start(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
-    state.active = True
+    await set_active_in_db(True)
     log.info("Моніторинг УВІМКНЕНО через API")
     return {"active": True}
 
@@ -245,7 +321,7 @@ async def start(x_api_key: str | None = Header(default=None)):
 @app.post("/stop")
 async def stop(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
-    state.active = False
+    await set_active_in_db(False)
     log.info("Моніторинг ВИМКНЕНО через API")
     return {"active": False}
 
@@ -274,6 +350,8 @@ async def main():
         raise SystemExit("Не вказано жодного номера в MY_PHONE_NUMBERS (.env)")
     if not CONTROL_SECRET:
         raise SystemExit("Задайте CONTROL_SECRET у .env — це пароль для керування з сайту")
+
+    await init_db()
 
     await tg_client.start()
     log.info("Telegram підключено. Канали: %s", CHANNELS)

@@ -3,3 +3,4 @@ twilio
 python-dotenv
 fastapi
 uvicorn
+asyncpg
