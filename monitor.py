@@ -174,16 +174,6 @@ async def get_calls_today() -> int:
     return count or 0
 
 
-def add_event(kind: str, channel: str, keyword: str, snippet: str = ""):
-    """Додає запис у журнал подій (для показу на сайті через /logs)."""
-    state.events.insert(0, {
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "kind": kind,          # "keyword" (знайдено слово) або "call" (здійснено дзвінок)
-        "channel": channel,
-        "keyword": keyword,
-        "snippet": snippet,
-    })
-    del state.events[MAX_LOG_ENTRIES:]
 
 # ---------- Twilio ----------
 
