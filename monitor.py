@@ -182,6 +182,49 @@ async def get_calls_today() -> int:
     return count or 0
 
 
+async def get_daily_activity(days: int = 14):
+    """Кількість дзвінків/push по днях за останні N днів (для графіка)."""
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                (ts AT TIME ZONE 'Europe/Kyiv')::date AS day,
+                COUNT(*) FILTER (WHERE kind = 'call') AS calls,
+                COUNT(*) FILTER (WHERE kind = 'push') AS pushes
+            FROM events
+            WHERE ts > now() - ($1 || ' days')::interval
+            GROUP BY day
+            ORDER BY day
+            """,
+            str(days),
+        )
+    return [
+        {"day": r["day"].strftime("%Y-%m-%d"), "calls": r["calls"], "pushes": r["pushes"]}
+        for r in rows
+    ]
+
+
+async def get_top_keywords(days: int = 30, limit: int = 10):
+    """Найчастіші ключові слова за останні N днів."""
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT keyword, COUNT(*) AS cnt
+            FROM events
+            WHERE kind IN ('call', 'push') AND ts > now() - ($1 || ' days')::interval
+            GROUP BY keyword
+            ORDER BY cnt DESC
+            LIMIT $2
+            """,
+            str(days), limit,
+        )
+    return [{"keyword": r["keyword"] or "?", "count": r["cnt"]} for r in rows]
+
+
 
 # ---------- Twilio ----------
 
@@ -318,6 +361,22 @@ async def status(x_api_key: str | None = Header(default=None)):
 async def logs(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
     return {"events": await get_recent_events()}
+
+
+@app.get("/stats")
+async def stats(x_api_key: str | None = Header(default=None)):
+    check_secret(x_api_key)
+    return {
+        "daily": await get_daily_activity(14),
+        "top_keywords": await get_top_keywords(30, 10),
+    }
+
+
+@app.get("/health")
+async def health():
+    """Публічний ендпоінт без ключа — для зовнішнього моніторингу (напр. UptimeRobot),
+    щоб перевіряти, чи сервер взагалі живий, без розкриття внутрішніх даних."""
+    return {"ok": True, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 @app.post("/start")
