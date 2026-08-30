@@ -71,12 +71,27 @@ log = logging.getLogger("monitor")
 class State:
     active: bool = True  # моніторинг активний за замовчуванням
     last_call_ts: float = 0.0
+    events: list = []  # журнал знайдених ключових слів / дзвінків (найновіші перші)
 
 state = State()
 
+MAX_LOG_ENTRIES = 100
+
+
+def add_event(kind: str, channel: str, keyword: str, snippet: str = ""):
+    """Додає запис у журнал подій (для показу на сайті через /logs)."""
+    state.events.insert(0, {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": kind,          # "keyword" (знайдено слово) або "call" (здійснено дзвінок)
+        "channel": channel,
+        "keyword": keyword,
+        "snippet": snippet,
+    })
+    del state.events[MAX_LOG_ENTRIES:]
+
 # ---------- Twilio ----------
 
-def make_calls():
+def make_calls(channel: str = "", keyword: str = ""):
     """Дзвонить на всі номери зі списку MY_PHONE_NUMBERS."""
     now = time.time()
     if now - state.last_call_ts < COOLDOWN_SECONDS:
@@ -93,8 +108,10 @@ def make_calls():
                 from_=TWILIO_FROM_NUMBER,
             )
             log.info("Дзвінок на %s ініційовано, SID: %s", number, call.sid)
+            add_event("call", channel, keyword, f"дзвінок на {number}")
         except Exception as e:
             log.error("Помилка при дзвінку на %s: %s", number, e)
+            add_event("call_error", channel, keyword, f"{number}: {e}")
 
 
 def text_matches_keywords(text: str) -> str | None:
@@ -124,7 +141,8 @@ async def handler(event):
         chat = await event.get_chat()
         chat_name = getattr(chat, "username", None) or getattr(chat, "title", "?")
         log.info("[%s] Знайдено '%s' у: %s", chat_name, matched, text[:200])
-        make_calls()
+        add_event("keyword", str(chat_name), matched, text[:200])
+        make_calls(channel=str(chat_name), keyword=matched)
     else:
         log.debug("Повідомлення без збігів: %s", text[:80])
 
@@ -150,6 +168,12 @@ def check_secret(x_api_key: str | None):
 async def status(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
     return {"active": state.active, "channels": CHANNELS, "keywords": KEYWORDS}
+
+
+@app.get("/logs")
+async def logs(x_api_key: str | None = Header(default=None)):
+    check_secret(x_api_key)
+    return {"events": state.events}
 
 
 @app.post("/start")
