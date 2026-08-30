@@ -54,6 +54,14 @@ PUSH_ONLY_KEYWORDS = [k.strip().lower() for k in os.getenv("PUSH_ONLY_KEYWORDS",
 # ігнорується, навіть якщо збігається ключове слово
 EXCLUDE_KEYWORDS = [k.strip().lower() for k in os.getenv("EXCLUDE_KEYWORDS", "").split(",") if k.strip()]
 
+# Канал (числовий ID типу -100xxxxxxxxxx, АБО @username), куди дублювати ВСІ
+# знайдені ключові слова (і ті, що дзвонять, і push-only).
+LOG_CHANNEL = os.getenv("LOG_CHANNEL", "").strip()
+if LOG_CHANNEL.lstrip("-").isdigit():
+    LOG_CHANNEL_ID = int(LOG_CHANNEL)
+else:
+    LOG_CHANNEL_ID = LOG_CHANNEL or None
+
 # Twilio
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -231,6 +239,17 @@ async def send_push(channel: str, keyword: str, snippet: str):
         log.error("Помилка надсилання push: %s", e)
 
 
+async def send_to_log_channel(channel: str, keyword: str, snippet: str):
+    """Дублює будь-яке знайдене ключове слово у власний канал (LOG_CHANNEL)."""
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        text = f"🔎 '{keyword}' у [{channel}]:\n{snippet}"
+        await tg_client.send_message(LOG_CHANNEL_ID, text)
+    except Exception as e:
+        log.error("Помилка надсилання в LOG_CHANNEL: %s", e)
+
+
 # ---------- Telegram ----------
 
 tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -258,6 +277,7 @@ async def handler(event):
     chat_name = str(getattr(chat, "username", None) or getattr(chat, "title", "?"))
     log.info("[%s] Знайдено '%s' у: %s", chat_name, matched, text[:200])
     await add_event("keyword", chat_name, matched, text[:200])
+    await send_to_log_channel(chat_name, matched, text[:200])
 
     if matched in PUSH_ONLY_KEYWORDS:
         await send_push(chat_name, matched, text[:200])
@@ -348,6 +368,7 @@ async def main():
     log.info("Ключові слова: %s", KEYWORDS)
     log.info("Push-only слова (без дзвінка): %s", PUSH_ONLY_KEYWORDS)
     log.info("Стоп-фрази (виключення): %s", EXCLUDE_KEYWORDS)
+    log.info("LOG_CHANNEL: %s", LOG_CHANNEL_ID or "не задано")
     log.info("Номери для дзвінків: %s", MY_PHONE_NUMBERS)
 
     config = uvicorn.Config(app, host="0.0.0.0", port=CONTROL_PORT, log_level="info")
