@@ -41,6 +41,14 @@ CHANNELS = [c.strip() for c in os.getenv("TG_CHANNELS", "").split(",") if c.stri
 # Ключові слова (регістр не враховується)
 KEYWORDS = [k.strip().lower() for k in os.getenv("KEYWORDS", "").split(",") if k.strip()]
 
+# Слова, для яких НЕ дзвонимо, а лише надсилаємо push-повідомлення в Telegram
+# (Saved Messages акаунта, під яким залогінений бот)
+PUSH_ONLY_KEYWORDS = [k.strip().lower() for k in os.getenv("PUSH_ONLY_KEYWORDS", "").split(",") if k.strip()]
+
+# Стоп-фрази: якщо повідомлення містить будь-яку з них, воно повністю
+# ігнорується, навіть якщо збігається ключове слово
+EXCLUDE_KEYWORDS = [k.strip().lower() for k in os.getenv("EXCLUDE_KEYWORDS", "").split(",") if k.strip()]
+
 # Twilio
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -72,10 +80,20 @@ class State:
     active: bool = True  # моніторинг активний за замовчуванням
     last_call_ts: float = 0.0
     events: list = []  # журнал знайдених ключових слів / дзвінків (найновіші перші)
+    calls_today: int = 0
+    calls_today_date: str = ""
 
 state = State()
 
 MAX_LOG_ENTRIES = 100
+
+
+def bump_call_counter():
+    today = time.strftime("%Y-%m-%d")
+    if state.calls_today_date != today:
+        state.calls_today_date = today
+        state.calls_today = 0
+    state.calls_today += 1
 
 
 def add_event(kind: str, channel: str, keyword: str, snippet: str = ""):
@@ -109,6 +127,7 @@ def make_calls(channel: str = "", keyword: str = ""):
             )
             log.info("Дзвінок на %s ініційовано, SID: %s", number, call.sid)
             add_event("call", channel, keyword, f"дзвінок на {number}")
+            bump_call_counter()
         except Exception as e:
             log.error("Помилка при дзвінку на %s: %s", number, e)
             add_event("call_error", channel, keyword, f"{number}: {e}")
@@ -124,6 +143,27 @@ def text_matches_keywords(text: str) -> str | None:
     return None
 
 
+def text_has_exclusion(text: str) -> str | None:
+    if not text:
+        return None
+    lowered = text.lower()
+    for kw in EXCLUDE_KEYWORDS:
+        if kw in lowered:
+            return kw
+    return None
+
+
+async def send_push(channel: str, keyword: str, snippet: str):
+    """Надсилає push-повідомлення в Saved Messages акаунта (без дзвінка)."""
+    try:
+        text = f"⚠️ Знайдено '{keyword}' у [{channel}]:\n{snippet}"
+        await tg_client.send_message("me", text)
+        log.info("Push-повідомлення надіслано ('%s', %s)", keyword, channel)
+        add_event("push", channel, keyword, snippet)
+    except Exception as e:
+        log.error("Помилка надсилання push: %s", e)
+
+
 # ---------- Telegram ----------
 
 tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -137,14 +177,25 @@ async def handler(event):
 
     text = event.raw_text or ""
     matched = text_matches_keywords(text)
-    if matched:
-        chat = await event.get_chat()
-        chat_name = getattr(chat, "username", None) or getattr(chat, "title", "?")
-        log.info("[%s] Знайдено '%s' у: %s", chat_name, matched, text[:200])
-        add_event("keyword", str(chat_name), matched, text[:200])
-        make_calls(channel=str(chat_name), keyword=matched)
-    else:
+    if not matched:
         log.debug("Повідомлення без збігів: %s", text[:80])
+        return
+
+    excluded = text_has_exclusion(text)
+    if excluded:
+        log.info("Пропущено — містить стоп-фразу '%s'", excluded)
+        add_event("excluded", "", matched, f"стоп-фраза: {excluded}")
+        return
+
+    chat = await event.get_chat()
+    chat_name = str(getattr(chat, "username", None) or getattr(chat, "title", "?"))
+    log.info("[%s] Знайдено '%s' у: %s", chat_name, matched, text[:200])
+    add_event("keyword", chat_name, matched, text[:200])
+
+    if matched in PUSH_ONLY_KEYWORDS:
+        await send_push(chat_name, matched, text[:200])
+    else:
+        make_calls(channel=chat_name, keyword=matched)
 
 
 # ---------- HTTP API (керування з сайту) ----------
@@ -167,7 +218,14 @@ def check_secret(x_api_key: str | None):
 @app.get("/status")
 async def status(x_api_key: str | None = Header(default=None)):
     check_secret(x_api_key)
-    return {"active": state.active, "channels": CHANNELS, "keywords": KEYWORDS}
+    today = time.strftime("%Y-%m-%d")
+    calls_today = state.calls_today if state.calls_today_date == today else 0
+    return {
+        "active": state.active,
+        "channels": CHANNELS,
+        "keywords": KEYWORDS,
+        "calls_today": calls_today,
+    }
 
 
 @app.get("/logs")
@@ -220,6 +278,8 @@ async def main():
     await tg_client.start()
     log.info("Telegram підключено. Канали: %s", CHANNELS)
     log.info("Ключові слова: %s", KEYWORDS)
+    log.info("Push-only слова (без дзвінка): %s", PUSH_ONLY_KEYWORDS)
+    log.info("Стоп-фрази (виключення): %s", EXCLUDE_KEYWORDS)
     log.info("Номери для дзвінків: %s", MY_PHONE_NUMBERS)
 
     config = uvicorn.Config(app, host="0.0.0.0", port=CONTROL_PORT, log_level="info")
