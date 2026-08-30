@@ -168,6 +168,19 @@ async def stop(x_api_key: str | None = Header(default=None)):
     return {"active": False}
 
 
+@app.post("/restart")
+async def restart(x_api_key: str | None = Header(default=None)):
+    check_secret(x_api_key)
+    log.info("Перезапуск ініційовано через API")
+
+    async def _delayed_exit():
+        await asyncio.sleep(0.5)  # дати час відповіді дійти до сайту
+        os._exit(1)  # ненульовий код виходу -> Railway перезапустить процес
+
+    asyncio.create_task(_delayed_exit())
+    return {"restarting": True}
+
+
 # ---------- Запуск ----------
 
 async def main():
